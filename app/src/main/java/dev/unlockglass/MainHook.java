@@ -27,7 +27,8 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String KG_VIEW_MGR = "com.android.systemui.statusbar.phone.StatusBarKeyguardViewManager";
 
     private static volatile Object sKgViewMgr;
-    private static volatile boolean sSawFull;
+    private static volatile float sRest = Float.NaN;
+    private static volatile int sRawBucket = -1;
     private static volatile float sLastRatio = -1f;
     private static volatile int sLogBucket = -1;
 
@@ -119,21 +120,32 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** fraction: 1 = lock screen fully in place, 0 = swiped away (assumed, verified via log). */
+    /**
+     * fraction comes from ShadeExpansionStateManager. The resting value on the lock screen is
+     * learned from the first event after the keyguard starts showing (1 or 0), and the swipe
+     * progress is |fraction - rest|.
+     */
     private void onExpansion(float fraction, boolean tracking) {
         Object mgr = sKgViewMgr;
         if (mgr == null) return;
         Object ksc = XposedHelpers.getObjectField(mgr, "mKeyguardStateController");
-        boolean showing = ksc != null && (Boolean) XposedHelpers.callMethod(ksc, "isShowing");
+        boolean showing = ksc != null && XposedHelpers.getBooleanField(ksc, "mShowing");
         if (!showing) {
-            sSawFull = false;
+            sRest = Float.NaN;
             sLastRatio = -1f;
             return;
         }
-        if (fraction > 0.99f) sSawFull = true;
-        if (!sSawFull) return; // safety: only follow swipes that started from the resting lock screen
+        if (Float.isNaN(sRest)) {
+            sRest = fraction > 0.5f ? 1f : 0f;
+            XposedBridge.log(TAG + "keyguard showing, rest=" + sRest + " first fraction=" + fraction);
+        }
+        int rb = (int) (fraction * 10f);
+        if (rb != sRawBucket) {
+            sRawBucket = rb;
+            XposedBridge.log(TAG + "raw fraction=" + fraction + " tracking=" + tracking);
+        }
 
-        float ratio = Math.max(0f, Math.min(1f, 1f - fraction));
+        float ratio = Math.max(0f, Math.min(1f, Math.abs(fraction - sRest)));
         float last = sLastRatio;
         boolean edge = (ratio == 0f || ratio == 1f) && ratio != last;
         if (!edge && Math.abs(ratio - last) < 0.01f) return;
@@ -146,7 +158,7 @@ public class MainHook implements IXposedHookLoadPackage {
         int bucket = (int) (ratio * 10f);
         if (bucket != sLogBucket || edge) {
             sLogBucket = bucket;
-            XposedBridge.log(TAG + "swipe fraction=" + fraction + " ratio=" + ratio + " tracking=" + tracking);
+            XposedBridge.log(TAG + "sent ratio=" + ratio + " (fraction=" + fraction + ")");
         }
     }
 }

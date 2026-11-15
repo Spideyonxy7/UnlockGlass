@@ -1,11 +1,11 @@
-# UnlockGlass v0.2 (experimental)
+# UnlockGlass v0.3 (experimental)
 LSPosed module for HyperOS / SaanOS. Scope: com.miui.miwallpaper AND com.android.systemui.
 
 - wallpaper service: forces the built-in unlock animation on (anim=true, noNeedScaleAnim=false)
 - SystemUI: forwards lock screen swipe-up progress to the wallpaper service so blur/blend follows the finger
 
 ## Update
-unzip -o over ~/UnlockGlass, then: git add -A && git commit -m v0.2 && git push
+unzip -o over ~/UnlockGlass, then: git add -A && git commit -m v0.3 && git push
 Download the new APK from GitHub Actions (artifact UnlockGlass-debug).
 
 ## Install
