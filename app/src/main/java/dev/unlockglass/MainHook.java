@@ -27,6 +27,10 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String KG_VIEW_MGR = "com.android.systemui.statusbar.phone.StatusBarKeyguardViewManager";
 
     private static volatile Object sKgViewMgr;
+    private static volatile Object sWpMgr;
+    private static volatile boolean sWpNullLogged;
+    private static final java.util.concurrent.ConcurrentHashMap<String, Integer> BUCKETS =
+            new java.util.concurrent.ConcurrentHashMap<>();
     private static volatile float sRest = Float.NaN;
     private static volatile int sRawBucket = -1;
     private static volatile float sLastRatio = -1f;
@@ -38,6 +42,7 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "loaded in " + lpp.processName);
             hookAnimFlag(lpp.classLoader);
             hookScaleGate(lpp.classLoader);
+            hookRatioDiagnostics(lpp.classLoader);
         } else if ("com.android.systemui".equals(lpp.packageName)) {
             XposedBridge.log(TAG + "systemui loaded");
             hookSystemUi(lpp.classLoader);
@@ -103,6 +108,18 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "capture keyguard mgr failed: " + t);
         }
         try {
+            Class<?> wpm = XposedHelpers.findClass("com.android.keyguard.wallpaper.MiuiKeyguardWallPaperManager", cl);
+            XposedBridge.hookAllConstructors(wpm, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    sWpMgr = param.thisObject;
+                    XposedBridge.log(TAG + "captured MiuiKeyguardWallPaperManager");
+                }
+            });
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "capture wallpaper mgr failed: " + t);
+        }
+        try {
             XposedHelpers.findAndHookMethod(SHADE_MGR, cl, "onPanelExpansionChanged",
                     float.class, boolean.class, boolean.class, new XC_MethodHook() {
                         @Override
@@ -151,8 +168,17 @@ public class MainHook implements IXposedHookLoadPackage {
         if (!edge && Math.abs(ratio - last) < 0.01f) return;
         sLastRatio = ratio;
 
-        Object wp = XposedHelpers.getObjectField(mgr, "mMiuiKeyguardWallPaperManager");
-        if (wp == null) return;
+        Object wp = sWpMgr;
+        if (wp == null) {
+            try { wp = XposedHelpers.getObjectField(mgr, "mMiuiKeyguardWallPaperManager"); } catch (Throwable ignored) { }
+        }
+        if (wp == null) {
+            if (!sWpNullLogged) {
+                sWpNullLogged = true;
+                XposedBridge.log(TAG + "wallpaper manager is null, cannot send ratio");
+            }
+            return;
+        }
         XposedHelpers.callMethod(wp, "updateKeyguardWallpaperRatio", Float.valueOf(ratio));
 
         int bucket = (int) (ratio * 10f);
@@ -160,5 +186,50 @@ public class MainHook implements IXposedHookLoadPackage {
             sLogBucket = bucket;
             XposedBridge.log(TAG + "sent ratio=" + ratio + " (fraction=" + fraction + ")");
         }
+    }
+
+    // ============ diagnostics: where does the ratio die inside the wallpaper service? ============
+
+    private static void logBucket(String tag, float v) {
+        int b = (int) (v * 10f);
+        Integer prev = BUCKETS.put(tag, b);
+        if (prev == null || prev.intValue() != b) {
+            XposedBridge.log(TAG + tag + " ratio=" + v);
+        }
+    }
+
+    private XC_MethodHook ratioLogger(final String tag) {
+        return new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                try {
+                    logBucket(tag, (Float) param.args[0]);
+                } catch (Throwable ignored) { }
+            }
+        };
+    }
+
+    private void hookRatioDiagnostics(ClassLoader cl) {
+        String kg = "com.miui.miwallpaper.wallpaperservice.impl.keyguard.KeyguardImageEngineImpl";
+        String dr = "com.miui.miwallpaper.animation.DesktopUnlockIAnimationRenderer";
+        String kr = "com.miui.miwallpaper.animation.KeyguardUnlockIAnimationRenderer";
+        try {
+            XposedHelpers.findAndHookMethod(CTRL, cl, "updateKeyguardWallpaperRatio",
+                    float.class, long.class, ratioLogger("svc.ratio"));
+        } catch (Throwable t) { XposedBridge.log(TAG + "diag svc failed: " + t); }
+        try {
+            XposedHelpers.findAndHookMethod(DESKTOP, cl, "updateKeyguardWallpaperRatio",
+                    float.class, long.class, ratioLogger("desktopEngine.ratio"));
+        } catch (Throwable t) { XposedBridge.log(TAG + "diag desktop engine failed: " + t); }
+        try {
+            XposedHelpers.findAndHookMethod(kg, cl, "updateKeyguardWallpaperRatio",
+                    float.class, long.class, ratioLogger("keyguardEngine.ratio"));
+        } catch (Throwable t) { XposedBridge.log(TAG + "diag keyguard engine failed: " + t); }
+        try {
+            XposedHelpers.findAndHookMethod(dr, cl, "updateAnim", float.class, ratioLogger("desktopRenderer.updateAnim"));
+        } catch (Throwable t) { XposedBridge.log(TAG + "diag desktop renderer failed: " + t); }
+        try {
+            XposedHelpers.findAndHookMethod(kr, cl, "updateAnim", float.class, ratioLogger("keyguardRenderer.updateAnim"));
+        } catch (Throwable t) { XposedBridge.log(TAG + "diag keyguard renderer failed: " + t); }
     }
 }
