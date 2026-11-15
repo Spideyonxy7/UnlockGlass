@@ -27,6 +27,9 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String KG_VIEW_MGR = "com.android.systemui.statusbar.phone.StatusBarKeyguardViewManager";
 
     private static volatile Object sKgViewMgr;
+    /** how fast the lock wallpaper fades: alpha = 1 - ratio * GAIN (ratio 0..1 = swipe progress) */
+    private static final float GAIN = 3.0f;
+    private static final String KGENG = "com.miui.miwallpaper.wallpaperservice.impl.keyguard.KeyguardImageEngineImpl";
     private static volatile Object sWpMgr;
     private static volatile boolean sWpNullLogged;
     private static final java.util.concurrent.ConcurrentHashMap<String, Integer> BUCKETS =
@@ -43,6 +46,7 @@ public class MainHook implements IXposedHookLoadPackage {
             hookAnimFlag(lpp.classLoader);
             hookScaleGate(lpp.classLoader);
             hookRatioDiagnostics(lpp.classLoader);
+            hookFollowFinger(lpp.classLoader);
         } else if ("com.android.systemui".equals(lpp.packageName)) {
             XposedBridge.log(TAG + "systemui loaded");
             hookSystemUi(lpp.classLoader);
@@ -231,5 +235,45 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             XposedHelpers.findAndHookMethod(kr, cl, "updateAnim", float.class, ratioLogger("keyguardRenderer.updateAnim"));
         } catch (Throwable t) { XposedBridge.log(TAG + "diag keyguard renderer failed: " + t); }
+    }
+
+    // ============ v0.5: make the lock wallpaper fade out smoothly with the finger ============
+
+    private void hookFollowFinger(ClassLoader cl) {
+        // 1) stop the desktop engine's own reaction to the swipe ratio (it makes half the
+        //    home wallpaper pop in at the first touch)
+        try {
+            XposedHelpers.findAndHookMethod(DESKTOP, cl, "updateKeyguardWallpaperRatio",
+                    float.class, long.class, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            param.setResult(null);
+                        }
+                    });
+            XposedBridge.log(TAG + "hooked desktop ratio (blocked)");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "block desktop ratio failed: " + t);
+        }
+        // 2) lock wallpaper alpha follows the swipe progress instead of the stock blur/dim
+        try {
+            XposedHelpers.findAndHookMethod(KGENG, cl, "updateKeyguardWallpaperRatio",
+                    float.class, long.class, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                float r = (Float) param.args[0];
+                                float a = 1f - Math.min(1f, Math.max(0f, r) * GAIN);
+                                XposedHelpers.callMethod(param.thisObject, "updateAlpha", Float.valueOf(a));
+                                logBucket("lockAlpha", a);
+                                param.setResult(null);
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + "lock alpha failed: " + t);
+                            }
+                        }
+                    });
+            XposedBridge.log(TAG + "hooked keyguard ratio -> alpha");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "hook keyguard ratio failed: " + t);
+        }
     }
 }
