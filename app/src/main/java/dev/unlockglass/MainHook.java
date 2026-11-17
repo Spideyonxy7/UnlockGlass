@@ -35,10 +35,15 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String KG_VIEW_MGR = "com.android.systemui.statusbar.phone.StatusBarKeyguardViewManager";
     private static final String SHADE_VIEW = "com.android.systemui.shade.NotificationShadeWindowView";
 
-    /** swipe progress (0..1) at which the home wallpaper is fully visible */
-    private static final float RANGE = 0.30f;
-    private static final float START_SCALE = 1.12f;
-    private static final float MAX_BLUR = 30f;
+    // live-tunable with:  su -c "settings put global ug_range 0.6"   (read each time the keyguard shows)
+    //   ug_range  : swipe progress (0..1) at which the home wallpaper is fully visible (bigger = slower)
+    //   ug_scale  : start zoom of the home wallpaper (1.0 = no zoom)
+    //   ug_blur   : start blur radius (0 = no blur)
+    //   ug_front  : 1 = draw the layer ABOVE the lock screen content, 0 = behind it
+    private static float sRange = 0.55f;
+    private static float sStartScale = 1.12f;
+    private static float sMaxBlur = 30f;
+    private static boolean sFront = false;
 
     private static volatile Object sKgViewMgr;
     private static volatile ViewGroup sShadeView;
@@ -133,14 +138,54 @@ public class MainHook implements IXposedHookLoadPackage {
         }
         if (Float.isNaN(sRest)) {
             sRest = fraction > 0.5f ? 1f : 0f;
+            refreshConfig(shade.getContext());
             XposedBridge.log(TAG + "keyguard showing, rest=" + sRest + " first fraction=" + fraction);
         }
         boolean bouncer = readBool(ksc, "mPrimaryBouncerShowing");
 
         float ratio = Math.max(0f, Math.min(1f, Math.abs(fraction - sRest)));
-        float t = Math.min(1f, ratio / RANGE);
+        float t = Math.min(1f, ratio / Math.max(0.05f, sRange));
         float p = bouncer ? 0f : t * t * (3f - 2f * t); // smoothstep
         applyOverlay(shade, p);
+    }
+
+
+    // ---------------------------------------------------------------- live config
+
+    private static float cfg(Context ctx, String key, float def) {
+        try {
+            String v = android.provider.Settings.Global.getString(ctx.getContentResolver(), key);
+            if (v != null && !v.trim().isEmpty()) return Float.parseFloat(v.trim());
+        } catch (Throwable ignored) { }
+        return def;
+    }
+
+    private static void refreshConfig(Context ctx) {
+        sRange = cfg(ctx, "ug_range", 0.55f);
+        sStartScale = cfg(ctx, "ug_scale", 1.12f);
+        sMaxBlur = cfg(ctx, "ug_blur", 30f);
+        sFront = cfg(ctx, "ug_front", 0f) >= 0.5f;
+        XposedBridge.log(TAG + "config range=" + sRange + " scale=" + sStartScale
+                + " blur=" + sMaxBlur + " front=" + sFront);
+    }
+
+    private static void placeOverlay(ViewGroup shade, ImageView ov) {
+        try {
+            int last = shade.getChildCount() - 1;
+            int idx = shade.indexOfChild(ov);
+            boolean ok = sFront ? (idx == last) : (idx == 0);
+            if (ok) return;
+            shade.removeView(ov);
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+            if (sFront) {
+                shade.addView(ov, lp);
+            } else {
+                shade.addView(ov, 0, lp);
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "placeOverlay failed: " + t);
+        }
     }
 
     // ---------------------------------------------------------------- overlay layer
@@ -191,15 +236,17 @@ public class MainHook implements IXposedHookLoadPackage {
         if (ov == null) return;
         sLastP = p;
         if (ov.getVisibility() != View.VISIBLE) {
+            refreshConfig(shade.getContext());
+            placeOverlay(shade, ov);
             ov.setVisibility(View.VISIBLE);
             sNotShowingSince = 0;
             shade.postDelayed(CHECK, 120);
         }
-        float s = START_SCALE - (START_SCALE - 1f) * p;
+        float s = sStartScale - (sStartScale - 1f) * p;
         ov.setAlpha(p);
         ov.setScaleX(s);
         ov.setScaleY(s);
-        float blur = (1f - p) * MAX_BLUR;
+        float blur = (1f - p) * sMaxBlur;
         if (blur > 0.5f) {
             ov.setRenderEffect(RenderEffect.createBlurEffect(blur, blur, Shader.TileMode.CLAMP));
         } else {
