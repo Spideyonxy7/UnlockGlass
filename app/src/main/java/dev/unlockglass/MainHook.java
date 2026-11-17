@@ -1,5 +1,20 @@
 package dev.unlockglass;
 
+import android.app.WallpaperManager;
+import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.RenderEffect;
+import android.graphics.Shader;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
+import android.os.ParcelFileDescriptor;
+import android.os.SystemClock;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
+
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -7,96 +22,39 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * UnlockGlass v0.2 (experimental).
+ * UnlockGlass v0.6 (experimental). Scope: com.android.systemui only.
  *
- * miwallpaper : forces the built-in unlock animation on (same as v0.1).
- * systemui    : forwards the lock screen swipe-up progress to the wallpaper service
- *               (MiuiKeyguardWallPaperManager.updateKeyguardWallpaperRatio) so the
- *               blur/blend between lock and home wallpaper follows the finger.
+ * Instead of relying on the Xiaomi wallpaper service, we put our own image layer (the HOME
+ * wallpaper) behind the keyguard views, inside the notification shade window, and drive it with
+ * the lock screen swipe progress: crossfade + zoom 1.12 -> 1.0 + blur -> sharp.
  */
 public class MainHook implements IXposedHookLoadPackage {
     private static final String TAG = "[UnlockGlass] ";
 
-    // ---- miwallpaper ----
-    private static final String CTRL = "com.miui.miwallpaper.manager.WallpaperServiceController";
-    private static final String DESKTOP = "com.miui.miwallpaper.wallpaperservice.impl.desktop.DesktopImageEngineImpl";
-    private static final String CB = "com.miui.miwallpaper.IRemoteAnimationFinishedCallback";
-
-    // ---- systemui ----
     private static final String SHADE_MGR = "com.android.systemui.shade.ShadeExpansionStateManager";
     private static final String KG_VIEW_MGR = "com.android.systemui.statusbar.phone.StatusBarKeyguardViewManager";
+    private static final String SHADE_VIEW = "com.android.systemui.shade.NotificationShadeWindowView";
+
+    /** swipe progress (0..1) at which the home wallpaper is fully visible */
+    private static final float RANGE = 0.30f;
+    private static final float START_SCALE = 1.12f;
+    private static final float MAX_BLUR = 30f;
 
     private static volatile Object sKgViewMgr;
-    /** how fast the lock wallpaper fades: alpha = 1 - ratio * GAIN (ratio 0..1 = swipe progress) */
-    private static final float GAIN = 3.0f;
-    private static final String KGENG = "com.miui.miwallpaper.wallpaperservice.impl.keyguard.KeyguardImageEngineImpl";
-    private static volatile Object sWpMgr;
-    private static volatile boolean sWpNullLogged;
-    private static final java.util.concurrent.ConcurrentHashMap<String, Integer> BUCKETS =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    private static volatile float sRest = Float.NaN;
-    private static volatile int sRawBucket = -1;
-    private static volatile float sLastRatio = -1f;
-    private static volatile int sLogBucket = -1;
+    private static volatile ViewGroup sShadeView;
+    private static ImageView sOverlay;
+    private static float sRest = Float.NaN;
+    private static float sLastP = -1f;
+    private static boolean sReload = true;
+    private static long sNotShowingSince;
+    private static int sLogBucket = -1;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
-        if ("com.miui.miwallpaper".equals(lpp.packageName)) {
-            XposedBridge.log(TAG + "loaded in " + lpp.processName);
-            hookAnimFlag(lpp.classLoader);
-            hookScaleGate(lpp.classLoader);
-            hookRatioDiagnostics(lpp.classLoader);
-            hookFollowFinger(lpp.classLoader);
-        } else if ("com.android.systemui".equals(lpp.packageName)) {
-            XposedBridge.log(TAG + "systemui loaded");
-            hookSystemUi(lpp.classLoader);
-        }
+        if (!"com.android.systemui".equals(lpp.packageName)) return;
+        XposedBridge.log(TAG + "v0.6 systemui loaded");
+        hookSystemUi(lpp.classLoader);
     }
-
-    // ===================== miwallpaper =====================
-
-    private void hookAnimFlag(ClassLoader cl) {
-        try {
-            XposedHelpers.findAndHookMethod(CTRL, cl, "updateKeyguardWallpaperStateAnim",
-                    boolean.class, boolean.class, int.class, boolean.class, CB,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            boolean show = (Boolean) param.args[0];
-                            boolean anim = (Boolean) param.args[1];
-                            int mode = (Integer) param.args[2];
-                            XposedBridge.log(TAG + "StateAnim show=" + show + " anim=" + anim + " mode=" + mode);
-                            if (!show && !anim) param.args[1] = true;
-                        }
-                    });
-            XposedBridge.log(TAG + "hooked updateKeyguardWallpaperStateAnim");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "hookAnimFlag failed: " + t);
-        }
-    }
-
-    private void hookScaleGate(ClassLoader cl) {
-        try {
-            XposedHelpers.findAndHookMethod(DESKTOP, cl, "noNeedScaleAnim", new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    Object r = param.getResult();
-                    if (r instanceof Boolean && (Boolean) r) {
-                        boolean powerSave = false;
-                        try {
-                            powerSave = XposedHelpers.getBooleanField(param.thisObject, "mIsPowerSave");
-                        } catch (Throwable ignored) { }
-                        if (!powerSave) param.setResult(Boolean.FALSE);
-                    }
-                }
-            });
-            XposedBridge.log(TAG + "hooked noNeedScaleAnim");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "hookScaleGate failed: " + t);
-        }
-    }
-
-    // ======================= systemui =======================
 
     private void hookSystemUi(ClassLoader cl) {
         try {
@@ -112,16 +70,19 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedBridge.log(TAG + "capture keyguard mgr failed: " + t);
         }
         try {
-            Class<?> wpm = XposedHelpers.findClass("com.android.keyguard.wallpaper.MiuiKeyguardWallPaperManager", cl);
-            XposedBridge.hookAllConstructors(wpm, new XC_MethodHook() {
+            Class<?> sv = XposedHelpers.findClass(SHADE_VIEW, cl);
+            XposedBridge.hookAllConstructors(sv, new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
-                    sWpMgr = param.thisObject;
-                    XposedBridge.log(TAG + "captured MiuiKeyguardWallPaperManager");
+                    if (param.thisObject instanceof ViewGroup) {
+                        sShadeView = (ViewGroup) param.thisObject;
+                        sOverlay = null;
+                        XposedBridge.log(TAG + "captured NotificationShadeWindowView");
+                    }
                 }
             });
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "capture wallpaper mgr failed: " + t);
+            XposedBridge.log(TAG + "capture shade view failed: " + t);
         }
         try {
             XposedHelpers.findAndHookMethod(SHADE_MGR, cl, "onPanelExpansionChanged",
@@ -129,7 +90,7 @@ public class MainHook implements IXposedHookLoadPackage {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             try {
-                                onExpansion((Float) param.args[0], (Boolean) param.args[2]);
+                                onExpansion((Float) param.args[0]);
                             } catch (Throwable t) {
                                 XposedBridge.log(TAG + "onExpansion failed: " + t);
                             }
@@ -141,139 +102,175 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /**
-     * fraction comes from ShadeExpansionStateManager. The resting value on the lock screen is
-     * learned from the first event after the keyguard starts showing (1 or 0), and the swipe
-     * progress is |fraction - rest|.
-     */
-    private void onExpansion(float fraction, boolean tracking) {
+    // ---------------------------------------------------------------- swipe handling
+
+    private static boolean readBool(Object obj, String field) {
+        try {
+            return obj != null && XposedHelpers.getBooleanField(obj, field);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static Object kscOf(Object mgr) {
+        try {
+            return XposedHelpers.getObjectField(mgr, "mKeyguardStateController");
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private void onExpansion(float fraction) {
+        ViewGroup shade = sShadeView;
         Object mgr = sKgViewMgr;
-        if (mgr == null) return;
-        Object ksc = XposedHelpers.getObjectField(mgr, "mKeyguardStateController");
-        boolean showing = ksc != null && XposedHelpers.getBooleanField(ksc, "mShowing");
+        if (shade == null || mgr == null) return;
+
+        Object ksc = kscOf(mgr);
+        boolean showing = readBool(ksc, "mShowing");
         if (!showing) {
-            sRest = Float.NaN;
-            sLastRatio = -1f;
+            sRest = Float.NaN; // the CHECK runnable hides the overlay if it is still visible
             return;
         }
         if (Float.isNaN(sRest)) {
             sRest = fraction > 0.5f ? 1f : 0f;
             XposedBridge.log(TAG + "keyguard showing, rest=" + sRest + " first fraction=" + fraction);
         }
-        int rb = (int) (fraction * 10f);
-        if (rb != sRawBucket) {
-            sRawBucket = rb;
-            XposedBridge.log(TAG + "raw fraction=" + fraction + " tracking=" + tracking);
-        }
+        boolean bouncer = readBool(ksc, "mPrimaryBouncerShowing");
 
         float ratio = Math.max(0f, Math.min(1f, Math.abs(fraction - sRest)));
-        float last = sLastRatio;
-        boolean edge = (ratio == 0f || ratio == 1f) && ratio != last;
-        if (!edge && Math.abs(ratio - last) < 0.01f) return;
-        sLastRatio = ratio;
+        float t = Math.min(1f, ratio / RANGE);
+        float p = bouncer ? 0f : t * t * (3f - 2f * t); // smoothstep
+        applyOverlay(shade, p);
+    }
 
-        Object wp = sWpMgr;
-        if (wp == null) {
-            try { wp = XposedHelpers.getObjectField(mgr, "mMiuiKeyguardWallPaperManager"); } catch (Throwable ignored) { }
-        }
-        if (wp == null) {
-            if (!sWpNullLogged) {
-                sWpNullLogged = true;
-                XposedBridge.log(TAG + "wallpaper manager is null, cannot send ratio");
+    // ---------------------------------------------------------------- overlay layer
+
+    private static final Runnable CHECK = new Runnable() {
+        @Override
+        public void run() {
+            ViewGroup shade = sShadeView;
+            ImageView ov = sOverlay;
+            if (shade == null || ov == null || ov.getVisibility() != View.VISIBLE) return;
+            Object mgr = sKgViewMgr;
+            boolean showing = mgr != null && readBool(kscOf(mgr), "mShowing");
+            long now = SystemClock.uptimeMillis();
+            if (showing) {
+                sNotShowingSince = 0;
+                shade.postDelayed(this, 120);
+            } else {
+                if (sNotShowingSince == 0) sNotShowingSince = now;
+                if (now - sNotShowingSince > 400) {
+                    hideOverlay();
+                } else {
+                    shade.postDelayed(this, 120);
+                }
             }
+        }
+    };
+
+    private static void hideOverlay() {
+        ImageView ov = sOverlay;
+        if (ov != null) {
+            ov.setAlpha(0f);
+            ov.setRenderEffect(null);
+            ov.setVisibility(View.GONE);
+        }
+        sLastP = -1f;
+        sReload = true;
+        sLogBucket = -1;
+    }
+
+    private void applyOverlay(ViewGroup shade, float p) {
+        if (p <= 0f) {
+            if (sOverlay != null && sOverlay.getVisibility() == View.VISIBLE) hideOverlay();
+            sLastP = 0f;
             return;
         }
-        XposedHelpers.callMethod(wp, "updateKeyguardWallpaperRatio", Float.valueOf(ratio));
-
-        int bucket = (int) (ratio * 10f);
-        if (bucket != sLogBucket || edge) {
+        if (Math.abs(p - sLastP) < 0.004f && p < 1f) return;
+        ImageView ov = ensureOverlay(shade);
+        if (ov == null) return;
+        sLastP = p;
+        if (ov.getVisibility() != View.VISIBLE) {
+            ov.setVisibility(View.VISIBLE);
+            sNotShowingSince = 0;
+            shade.postDelayed(CHECK, 120);
+        }
+        float s = START_SCALE - (START_SCALE - 1f) * p;
+        ov.setAlpha(p);
+        ov.setScaleX(s);
+        ov.setScaleY(s);
+        float blur = (1f - p) * MAX_BLUR;
+        if (blur > 0.5f) {
+            ov.setRenderEffect(RenderEffect.createBlurEffect(blur, blur, Shader.TileMode.CLAMP));
+        } else {
+            ov.setRenderEffect(null);
+        }
+        int bucket = (int) (p * 10f);
+        if (bucket != sLogBucket) {
             sLogBucket = bucket;
-            XposedBridge.log(TAG + "sent ratio=" + ratio + " (fraction=" + fraction + ")");
+            XposedBridge.log(TAG + "overlay p=" + p + " scale=" + s + " blur=" + blur);
         }
     }
 
-    // ============ diagnostics: where does the ratio die inside the wallpaper service? ============
-
-    private static void logBucket(String tag, float v) {
-        int b = (int) (v * 10f);
-        Integer prev = BUCKETS.put(tag, b);
-        if (prev == null || prev.intValue() != b) {
-            XposedBridge.log(TAG + tag + " ratio=" + v);
-        }
-    }
-
-    private XC_MethodHook ratioLogger(final String tag) {
-        return new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
-                try {
-                    logBucket(tag, (Float) param.args[0]);
-                } catch (Throwable ignored) { }
+    private static ImageView ensureOverlay(ViewGroup shade) {
+        try {
+            Context ctx = shade.getContext();
+            if (sOverlay == null || sOverlay.getParent() != shade) {
+                ImageView iv = new ImageView(ctx);
+                iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                iv.setVisibility(View.GONE);
+                iv.setClickable(false);
+                iv.setFocusable(false);
+                shade.addView(iv, 0, new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                sOverlay = iv;
+                sReload = true;
+                XposedBridge.log(TAG + "overlay view added to shade window");
             }
-        };
-    }
-
-    private void hookRatioDiagnostics(ClassLoader cl) {
-        String kg = "com.miui.miwallpaper.wallpaperservice.impl.keyguard.KeyguardImageEngineImpl";
-        String dr = "com.miui.miwallpaper.animation.DesktopUnlockIAnimationRenderer";
-        String kr = "com.miui.miwallpaper.animation.KeyguardUnlockIAnimationRenderer";
-        try {
-            XposedHelpers.findAndHookMethod(CTRL, cl, "updateKeyguardWallpaperRatio",
-                    float.class, long.class, ratioLogger("svc.ratio"));
-        } catch (Throwable t) { XposedBridge.log(TAG + "diag svc failed: " + t); }
-        try {
-            XposedHelpers.findAndHookMethod(DESKTOP, cl, "updateKeyguardWallpaperRatio",
-                    float.class, long.class, ratioLogger("desktopEngine.ratio"));
-        } catch (Throwable t) { XposedBridge.log(TAG + "diag desktop engine failed: " + t); }
-        try {
-            XposedHelpers.findAndHookMethod(kg, cl, "updateKeyguardWallpaperRatio",
-                    float.class, long.class, ratioLogger("keyguardEngine.ratio"));
-        } catch (Throwable t) { XposedBridge.log(TAG + "diag keyguard engine failed: " + t); }
-        try {
-            XposedHelpers.findAndHookMethod(dr, cl, "updateAnim", float.class, ratioLogger("desktopRenderer.updateAnim"));
-        } catch (Throwable t) { XposedBridge.log(TAG + "diag desktop renderer failed: " + t); }
-        try {
-            XposedHelpers.findAndHookMethod(kr, cl, "updateAnim", float.class, ratioLogger("keyguardRenderer.updateAnim"));
-        } catch (Throwable t) { XposedBridge.log(TAG + "diag keyguard renderer failed: " + t); }
-    }
-
-    // ============ v0.5: make the lock wallpaper fade out smoothly with the finger ============
-
-    private void hookFollowFinger(ClassLoader cl) {
-        // 1) stop the desktop engine's own reaction to the swipe ratio (it makes half the
-        //    home wallpaper pop in at the first touch)
-        try {
-            XposedHelpers.findAndHookMethod(DESKTOP, cl, "updateKeyguardWallpaperRatio",
-                    float.class, long.class, new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            param.setResult(null);
-                        }
-                    });
-            XposedBridge.log(TAG + "hooked desktop ratio (blocked)");
+            if (sReload) {
+                Drawable d = loadHomeWallpaper(ctx);
+                if (d == null) return null;
+                sOverlay.setImageDrawable(d);
+                sReload = false;
+            }
+            return sOverlay;
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "block desktop ratio failed: " + t);
+            XposedBridge.log(TAG + "ensureOverlay failed: " + t);
+            return null;
         }
-        // 2) lock wallpaper alpha follows the swipe progress instead of the stock blur/dim
+    }
+
+    private static Drawable loadHomeWallpaper(Context ctx) {
         try {
-            XposedHelpers.findAndHookMethod(KGENG, cl, "updateKeyguardWallpaperRatio",
-                    float.class, long.class, new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            try {
-                                float r = (Float) param.args[0];
-                                float a = 1f - Math.min(1f, Math.max(0f, r) * GAIN);
-                                XposedHelpers.callMethod(param.thisObject, "updateAlpha", Float.valueOf(a));
-                                logBucket("lockAlpha", a);
-                                param.setResult(null);
-                            } catch (Throwable t) {
-                                XposedBridge.log(TAG + "lock alpha failed: " + t);
-                            }
-                        }
-                    });
-            XposedBridge.log(TAG + "hooked keyguard ratio -> alpha");
+            WallpaperManager wm = WallpaperManager.getInstance(ctx);
+            ParcelFileDescriptor pfd = wm.getWallpaperFile(WallpaperManager.FLAG_SYSTEM);
+            if (pfd != null) {
+                BitmapFactory.Options o = new BitmapFactory.Options();
+                o.inJustDecodeBounds = true;
+                BitmapFactory.decodeFileDescriptor(pfd.getFileDescriptor(), null, o);
+                pfd.close();
+                int sample = 1;
+                while (Math.max(o.outWidth, o.outHeight) / (sample * 2) >= 2400) sample *= 2;
+                BitmapFactory.Options o2 = new BitmapFactory.Options();
+                o2.inSampleSize = sample;
+                ParcelFileDescriptor pfd2 = wm.getWallpaperFile(WallpaperManager.FLAG_SYSTEM);
+                Bitmap bmp = BitmapFactory.decodeFileDescriptor(pfd2.getFileDescriptor(), null, o2);
+                pfd2.close();
+                if (bmp != null) {
+                    XposedBridge.log(TAG + "home wallpaper loaded " + bmp.getWidth() + "x" + bmp.getHeight());
+                    return new BitmapDrawable(ctx.getResources(), bmp);
+                }
+            }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "hook keyguard ratio failed: " + t);
+            XposedBridge.log(TAG + "getWallpaperFile failed: " + t);
+        }
+        try {
+            Drawable d = WallpaperManager.getInstance(ctx).getDrawable();
+            XposedBridge.log(TAG + "home wallpaper via getDrawable: " + (d != null));
+            return d;
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "getDrawable failed: " + t);
+            return null;
         }
     }
 }

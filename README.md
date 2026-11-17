@@ -1,16 +1,12 @@
-# UnlockGlass v0.5 (experimental)
-LSPosed module for HyperOS / SaanOS. Scope: com.miui.miwallpaper AND com.android.systemui.
+# UnlockGlass v0.6 (experimental)
+LSPosed module for HyperOS / SaanOS. Scope: com.android.systemui ONLY.
 
-- wallpaper service: forces the built-in unlock animation on (anim=true, noNeedScaleAnim=false)
-- SystemUI: forwards lock screen swipe-up progress to the wallpaper service so blur/blend follows the finger
+Adds an image layer (your home wallpaper) behind the lock screen views and drives it with the
+lock screen swipe: crossfade + zoom 1.12 -> 1.0 + blur -> sharp. Does not touch the Xiaomi wallpaper service.
 
-## Update
-unzip -o over ~/UnlockGlass, then: git add -A && git commit -m v0.5 && git push
-Download the new APK from GitHub Actions (artifact UnlockGlass-debug).
+Tunables in MainHook.java: RANGE, START_SCALE, MAX_BLUR.
 
-## Install
-1. Install APK, LSPosed: enable module, scope = Wallpaper (com.miui.miwallpaper) + System UI (com.android.systemui)
-2. su -c "am force-stop com.miui.miwallpaper" ; then restart SystemUI: su -c "killall com.android.systemui" (or reboot)
-3. Lock, swipe up slowly, release halfway, then swipe to unlock. Then:
-   su -c "logcat -d" | grep UnlockGlass
-Disable the module in LSPosed to roll back.
+Update: unzip -o over ~/UnlockGlass, git add -A && git commit -m v0.6 && git push, then take the APK from Actions.
+After install: su -c "killall com.android.systemui" (or reboot).
+Logs: su -c "logcat -d" | grep UnlockGlass
+Roll back: disable the module in LSPosed.
